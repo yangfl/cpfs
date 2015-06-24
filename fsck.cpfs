@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+from __future__ import print_function, absolute_import
+
+from cpfs.fsck import do_fscks, CONVENTIONAL_CHECKS
+from cpfs.logger import set_logger
+from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.storage import parser_add_url, init_storage_operations
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+
+    parser_add_url(parser)
+
+    parser.add_argument('-f', '--full', dest='full',
+                        action='store_true',
+                        help='full test(can be very slow)')
+    parser.add_argument('-N', dest='test',
+                        action='store_true', help='test only')
+    parser.add_argument('-V', '--verbose', dest='verbose',
+                        action='store_true', help='verbose')
+
+    args = parser.parse_args()
+
+    set_logger(args.verbose)
+
+    storage_operations = init_storage_operations(args.url[0])
+    metadata_conn = TmpMetadataConnection(
+        storage_operations.read(METADATA_STORAGE_NAME)
+    )
+
+    try:
+        exit_code = do_fscks(CONVENTIONAL_CHECKS,
+                             metadata_conn, args.verbose, args.test)
+        if args.full:
+            pass
+    except KeyboardInterrupt:
+        exit_code = 32
+
+    if exit_code == 1:
+        metadata_dump = metadata_conn.dump()
+        storage_operations.write(METADATA_STORAGE_NAME, 0, metadata_dump)
+        storage_operations.truncate(METADATA_STORAGE_NAME, len(metadata_dump))
+    storage_operations.destory()
+
+    exit(exit_code)

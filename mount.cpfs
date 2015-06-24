@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+
+from __future__ import division, print_function, absolute_import
+
+from collections import Counter, defaultdict
+import errno
+import llfuse
+from math import ceil
+from cpfs.compatibility import PY2, blob_type, Queue
+from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.logger import logger, set_logger
+from cpfs.storage import parser_add_url, init_storage_operations
+from cpfs.register import Register
+import os
+from stat import *
+from time import time, sleep
+import threading
+
+
+class FuseOperations(llfuse.Operations):
+    def __init__(self, store_op, **kwargs):
+        super(FuseOperations, self).__init__()
+
+        # basic
+        self.store_op = store_op
+
+        # options
+        self.__dict__.update(kwargs)
+        '''blksize'''
+
+        # load filesystem metadata
+        self.store_op.open(METADATA_STORAGE_NAME)
+        self.conn = TmpMetadataConnection(
+            self.store_op.read(METADATA_STORAGE_NAME))
+        self.store_op.close(METADATA_STORAGE_NAME)
+        assert self.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='inodes'").fetchone(), \
+            'not formatted yet'
+
+        # inode control
+        self.counter_inode_lookup = Counter()
+        self.lock_counter_inode_lookup = threading.RLock()
+        self.counter_inode_open = Counter()
+        self.lock_counter_inode_open = threading.Lock()
+        self.set_unlinked_inode = set()
+        self.register_fh_inode = Register(1, 262143)
+
+        # stat info
+        self.stat_ = llfuse.StatvfsData()
+        self.stat_.f_bsize = self.blksize
+        self.stat_.f_frsize = self.blksize
+        # self.stat_.f_blocks
+        # self.stat_.f_bfree
+        # self.stat_.f_bavail
+        self.stat_.f_files = 0
+        self.stat_.f_ffree = 0
+        self.stat_.f_favail = self.stat_.f_ffree
+
+    def _create(self, inode_parent, bytes_name, mode,
+                ctx, rdev=0, bytes_target=None):
+        '''if next(create_cur.execute(
+                'SELECT nlink FROM inodes WHERE inode = ?',
+                (inode_parent,))) <= 0:
+            logger.warn('Attempted to create entry %s with unlinked parent %d',
+                        bytes_name, inode_parent)
+            raise FUSEError(errno.EINVAL)'''
+        with self.conn.writeable_cursor() as create_cur:
+            create_cur.execute(
+                "INSERT INTO inodes (uid, gid, mode, rdev, size, "
+                "atime, ctime, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ctx.uid, ctx.gid, mode, rdev,
+                    bytes_target and len(bytes_target) or 0) + (time(),) * 3)
+            inode = create_cur.lastrowid
+            if bytes_target:
+                create_cur.execute(
+                    "INSERT INTO targets (inode, path) VALUES (?, ?)",
+                    (inode, blob_type(bytes_target)))
+        return self._link(inode, inode_parent, bytes_name)
+
+    def _debug(self, func_s, **kwargs):
+        return logger.debug('{} -> {}({})'.format(
+            threading.current_thread().name, func_s,
+            ', '.join('{}={}'.format(*i) for i in kwargs.items())))
+
+    def _isreg(self, inode, mode=None):
+        if not mode:
+            mode, = next(self.conn.execute(
+                'SELECT mode FROM inodes WHERE inode = ?', (inode,)))
+        return S_ISREG(mode)
+
+    def _link(self, inode, inode_parent, bytes_name):
+        with self.conn.writeable_cursor() as link_cur:
+            link_cur.execute(
+                "INSERT INTO contents (name, inode, parent_inode) "
+                "VALUES (?, ?, ?)",
+                (bytes_name, inode, inode_parent))
+            link_cur.execute(
+                "UPDATE inodes SET nlink = nlink + 1 WHERE inode = ?",
+                (inode,))
+        with self.lock_counter_inode_lookup:
+            self.counter_inode_lookup[inode] += 1
+        return self.getattr(inode)
+
+    def _lookup(self, inode_parent, bytes_name):
+        return self.conn.execute(
+            "SELECT * FROM contents WHERE name = ? AND parent_inode = ?",
+            (bytes_name, inode_parent)).fetchone()
+
+    def _path(self, inode, single=True):
+        if inode == llfuse.ROOT_INODE:
+            return not single and (name for name in ([],)) or []
+        path_generator = (
+            self._path(parent_inode, True) + [name]
+            for name, parent_inode in
+            self.conn.execute(
+                "SELECT name, parent_inode FROM contents  WHERE inode = ?",
+                (inode,)))
+        if single:
+            return path_generator.next()
+        return path_generator
+
+    def _remove(self, inode):
+        # blob
+        if self.store_op.isfile(str(inode)):
+            self.store_op.remove(str(inode))
+        # metadata
+        with self.conn.writeable_cursor() as remove_cur:
+            remove_cur.execute("DELETE FROM xattrs WHERE inode = ?", (inode,))
+            remove_cur.execute("DELETE FROM targets WHERE inode = ?", (inode,))
+            remove_cur.execute("DELETE FROM inodes WHERE inode = ?", (inode,))
+        # flow control
+        try:
+            self.set_unlinked_inode.remove(inode)
+        except KeyError:
+            pass
+        with self.lock_counter_inode_lookup:
+            assert self.counter_inode_lookup[inode] == 0
+            del self.counter_inode_lookup[inode]
+
+    def _unlink(self, rowid, bytes_name, inode, inode_parent):
+        with self.conn.writeable_cursor() as unlink_cur:
+            unlink_cur.execute(
+                "DELETE FROM contents WHERE rowid = ?", (rowid,))
+            unlink_cur.execute(
+                "UPDATE inodes SET nlink = nlink - 1 WHERE inode = ?",
+                (inode, ))
+            st_nlink, = next(unlink_cur.execute(
+                "SELECT nlink FROM inodes WHERE inode = ?", (inode, )))
+        if st_nlink < 1:
+            if self.counter_inode_lookup[inode] < 1:
+                self._remove(inode)
+            else:
+                self.set_unlinked_inode.add(inode)
+        return inode
+
+    def access(self, inode, mode, ctx):
+        self._debug('access', inode=inode, mode=mode, ctx=ctx)
+        access_info = next(self.conn.execute(
+            "SELECT mode, uid, gid FROM inodes WHERE inode = ?", (inode,)))
+        return ((mode & (access_info[0] >>
+                         (access_info[1] == ctx.uid and 6 or
+                         (access_info[2] == ctx.gid and 3 or 0)
+                          ))) == mode)
+
+    def create(self, inode_parent, name, mode, flags, ctx):
+        self._debug('create', inode_parent=inode_parent, name=name,
+                    mode=mode, flags=flags, ctx=ctx)
+        inode_i = self._create(inode_parent, blob_type(name), mode, ctx)
+        return self.open(inode_i.st_ino, flags), inode_i
+
+    def destroy(self):
+        self._debug('destory')
+        metadata_dump = self.conn.dump()
+        self.store_op.open(METADATA_STORAGE_NAME)
+        self.store_op.write(METADATA_STORAGE_NAME, 0, metadata_dump)
+        self.store_op.truncate(METADATA_STORAGE_NAME, len(metadata_dump))
+        self.store_op.flush(METADATA_STORAGE_NAME)
+        self.store_op.close(METADATA_STORAGE_NAME)
+        self.store_op.destory()
+
+    def flush(self, fh):
+        # self._debug('flush', fh=fh)
+        self.fsync(fh, False, True)
+
+    def forget(self, inode_lookup_count_l):
+        self._debug('forget', inode_lookup_count_l=inode_lookup_count_l)
+        with self.lock_counter_inode_lookup:
+            for inode, forget_lookup_count in inode_lookup_count_l:
+                self.counter_inode_lookup[inode] -= forget_lookup_count
+                if self.counter_inode_lookup[inode] < 1 and \
+                        inode in self.set_unlinked_inode:
+                    self._remove(inode)
+
+    def fsync(self, fh, datasync, flush=False):
+        self._debug(flush and 'flush' or 'fsync', fh=fh, datasync=datasync)
+        inode = self.register_fh_inode[fh]
+        if self._isreg(inode):
+            self.store_op.flush(str(inode))
+            if not datasync:
+                self.conn.write_execute(
+                    "UPDATE inodes SET size = ? WHERE inode = ?",
+                    (self.store_op.size(str(inode)), inode))
+
+    def fsyncdir(self, fh, datasync):
+        self._debug('fsyncdir', fh=fh, datasync=datasync)
+
+    def getattr(self, inode):
+        self._debug('getattr', inode=inode)
+        inode_i = llfuse.EntryAttributes()
+        list(map(lambda l: setattr(inode_i, *l), (
+            ('st_blksize', self.blksize),
+            ('entry_timeout', 300),
+            ('attr_timeout', 300),
+        )))
+        list(map(lambda l: setattr(inode_i, *l), zip(
+            (
+                'st_ino', 'generation', 'st_mode', 'st_nlink',
+                'st_uid', 'st_gid', 'st_rdev', 'st_size',
+                'st_atime', 'st_ctime', 'st_mtime'),
+            next(self.conn.execute(
+                'SELECT * FROM inodes WHERE inode = ?', (inode,)))
+        )))
+        inode_i.st_blocks = ceil(inode_i.st_size / inode_i.st_blksize)
+        return inode_i
+
+    def getxattr(self, inode, key):
+        self._debug('getxattr', inode=inode, key=key)
+        list_value = self.conn.cursor().execute(
+            "SELECT value FROM xattrs WHERE inode = ? AND key = ?",
+            (inode, blob_type(key))).fetchone()
+        if list_value:
+            return list_value[0]
+        else:
+            raise llfuse.FUSEError(llfuse.ENOATTR)
+
+    def link(self, inode, inode_new_parent, new_name):
+        self._debug('link', inode=inode,
+                    inode_new_parent=inode_new_parent,
+                    new_name=new_name)
+        return self._link(inode, inode_new_parent, blob_type(new_name))
+
+    def listxattr(self, inode):
+        # for py2/3 compatibility
+        self._debug('listxattr', inode=inode)
+        list_list_xattr = tuple(zip(*self.conn.execute(
+            "SELECT key FROM xattrs WHERE inode = ?", (inode,)).fetchall()))
+        if list_list_xattr:
+            list_xattr = list_list_xattr[0]
+        else:
+            list_xattr = ()
+        print(list_xattr)
+        if PY2:
+            return map(bytes, list_xattr)
+        else:
+            return list_xattr
+
+    def lookup(self, inode_parent, name):
+        self._debug('lookup', inode_parent=inode_parent, name=name)
+        if name == b'.':
+            inode = inode_parent
+        else:
+            if name == b'..':
+                inode, = next(self.conn.execute(
+                    "SELECT parent_inode FROM contents WHERE inode = ?",
+                    (inode_parent,)))
+            else:
+                try:
+                    inode = self._lookup(inode_parent, blob_type(name))[2]
+                except TypeError:
+                    raise llfuse.FUSEError(errno.ENOENT)
+        with self.lock_counter_inode_lookup:
+            self.counter_inode_lookup[inode] += 1
+        return self.getattr(inode)
+
+    def mkdir(self, inode_parent, name, mode, ctx):
+        self._debug('mkdir', inode_parent=inode_parent, name=name,
+                    mode=mode, ctx=ctx)
+        return self._create(inode_parent, blob_type(name), mode, ctx)
+
+    def mknod(self, inode_parent, name, mode, rdev, ctx):
+        self._debug('mknod', inode_parent=inode_parent, name=name,
+                    mode=mode, rdev=rdev, ctx=ctx)
+        return self._create(inode_parent, blob_type(name), mode, ctx,
+                            rdev=rdev)
+
+    def open(self, inode, flags, is_dir=False):
+        self._debug(is_dir and 'opendir' or 'open', inode=inode, flags=flags)
+        mode, st_size, = next(self.conn.execute(
+            'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
+        if flags & os.O_CREAT and flags & os.O_EXCL and st_size:
+            raise llfuse.FUSEError(errno.EEXIST)
+        if S_ISREG(mode):
+            if not st_size and not self.store_op.isfile(str(inode)):
+                self.store_op.create(str(inode))
+            self.store_op.open(str(inode))
+        with self.lock_counter_inode_open:
+            self.counter_inode_open[inode] += 1
+        return self.register_fh_inode.register(inode)
+
+    def opendir(self, inode):
+        self._debug('opendir', inode=inode)
+        return self.open(inode, 0, True)
+
+    def read(self, fh, offset, length):
+        self._debug('read', fh=fh, offset=offset, length=length)
+        return self.store_op.read(
+            str(self.register_fh_inode[fh]), offset, length)
+
+    def readdir(self, fh, offset):
+        self._debug('readdir', fh=fh, offset=offset)
+        for name, inode, rowid in self.conn.execute(
+                "SELECT name, inode, rowid FROM contents "
+                "WHERE parent_inode = ? AND rowid > ?",
+                (self.register_fh_inode[fh], offset)):
+            yield (bytes(name), self.getattr(inode), rowid)
+
+    def readlink(self, inode):
+        self._debug('readlink', inode=inode)
+        return bytes(next(self.conn.execute(
+            "SELECT path FROM targets WHERE inode = ?", (inode,)))[0])
+
+    def release(self, fh, is_dir=False):
+        inode = self.register_fh_inode[fh]
+        self._debug(is_dir and 'releasedir' or 'release', fh=fh, inode=inode)
+        del self.register_fh_inode[fh]
+        with self.lock_counter_inode_open:
+            self.counter_inode_open[inode] -= 1
+            if self.counter_inode_open[inode] < 1:
+                mode, st_size, = next(self.conn.execute(
+                    'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
+                if S_ISREG(mode):
+                    self.store_op.close(str(inode))
+                    if not st_size:
+                        self.store_op.remove(str(inode))
+                del self.counter_inode_open[inode]
+
+    def releasedir(self, fh):
+        return self.release(fh, True)
+
+    def removexattr(self, inode, key):
+        self._debug('removexattr', inode=inode, key=key)
+        bytes_key = blob_type(key)
+        entry = self.conn.execute(
+            "SELECT rowid FROM xattrs WHERE inode = ? AND key = ?",
+            (inode, bytes_key)).fetchone()
+        if not entry:
+            raise llfuse.FUSEError(llfuse.ENOATTR)
+        self.conn.write_execute(
+            "DELETE FROM xattrs WHERE rowid = ?", (entry[0],))
+
+    def rename(self, inode_parent_old, name_old, inode_parent_new,
+               name_new):
+        self._debug('rename', inode_parent_old=inode_parent_old,
+                    name_old=name_old,
+                    inode_parent_new=inode_parent_new,
+                    name_new=name_new)
+        bytes_name_new = blob_type(name_new)
+        exist_entry = self._lookup(inode_parent_new, blob_type(name_new))
+        if exist_entry:
+            self._unlink(*exist_entry)
+        self.conn.write_execute(
+            "UPDATE contents SET parent_inode = ?, name = ? "
+            "WHERE rowid = ?",
+            (
+                inode_parent_new, bytes_name_new,
+                self._lookup(inode_parent_old, blob_type(name_old))[0]))
+
+    def rmdir(self, inode_parent, name):
+        self._debug('rmdir', inode_parent=inode_parent, name=name)
+        entry = self._lookup(inode_parent, blob_type(name))
+        if not S_ISDIR(next(self.conn.execute(
+                'SELECT mode FROM inodes WHERE inode = ?', (entry[2],)))[0]):
+            raise llfuse.FUSEError(errno.ENOTDIR)
+        '''if next(self.conn.execute(
+                'SELECT * FROM contents WHERE parent_inode = ?', (entry[2],))):
+            raise llfuse.FUSEError(errno.ENOTEMPTY)'''
+        self._unlink(*entry)
+
+    def setattr(self, inode, attr_i):
+        self._debug('setattr', inode=inode, attr_i=attr_i)
+        self.conn.write_execute(
+            "UPDATE inodes SET {} WHERE inode = ?".format(
+                ', '.join(
+                    map(' = '.join, (
+                        (
+                            attr_name.startswith('st_') and attr_name[3:]
+                            or attr_name,
+                            str(getattr(attr_i, attr_name)))
+                        for attr_name in (
+                            'generation', 'st_mode', 'st_uid', 'st_gid',
+                            'st_rdev', 'st_size',
+                            'st_atime', 'st_ctime', 'st_mtime')
+                        if getattr(attr_i, attr_name))))), (inode,))
+        if attr_i.st_size:
+            self.store_op.truncate(str(inode), attr_i.st_size)
+        return self.getattr(inode)
+
+    def setxattr(self, inode, key, value):
+        self._debug('setxattr', inode=inode, key=key, value=value)
+        bytes_key = blob_type(key)
+        bytes_value = blob_type(value)
+        with self.conn.writeable_cursor() as setxattr_cur:
+            entry = setxattr_cur.execute(
+                "SELECT rowid FROM xattrs WHERE inode = ? AND key = ?",
+                (inode, bytes_key)).fetchone()
+            if entry:
+                rowid, = entry
+                setxattr_cur.execute(
+                    "UPDATE xattrs SET value = ? WHERE rowid = ?",
+                    (bytes_value, rowid))
+            else:
+                setxattr_cur.execute(
+                    "INSERT INTO xattrs (inode, key, value) "
+                    "VALUES (?, ?, ?)",
+                    (inode, bytes_key, bytes_value))
+
+    def statfs(self):
+        self._debug('statfs')
+        used_size, total_size = self.store_op.statfs()
+        self.stat_.f_blocks = total_size // self.stat_.f_frsize
+        self.stat_.f_bfree = \
+            self.stat_.f_blocks - used_size // self.stat_.f_frsize
+        self.stat_.f_bavail = self.stat_.f_bfree
+        return self.stat_
+
+    def symlink(self, inode_parent, name, target, ctx):
+        self._debug('symlink', inode_parent=inode_parent, name=name,
+                    target=target, ctx=ctx)
+        return self._create(
+            inode_parent, blob_type(name),
+            S_IFLNK | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IWGRP |
+            S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH,
+            ctx, bytes_target=blob_type(target))
+
+    def unlink(self, inode_parent, name):
+        self._debug('unlink', inode_parent=inode_parent, name=name)
+        self._unlink(*self._lookup(inode_parent, blob_type(name)))
+
+    def write(self, fh, offset, buf):
+        self._debug('write', fh=fh, offset=offset, buf_len=len(buf))
+        self.store_op.write(str(self.register_fh_inode[fh]), offset, buf)
+        return len(buf)
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Complete file system.',
+        usage='%(prog)s  [-p] [-r args] [-v] -c path \n'
+        'scheme://[[[username[:password]@]hostname][/path]] mountpoint',
+    )
+
+    parser_add_url(parser)
+    parser.add_argument('mountpoint', nargs=1)
+    parser.add_argument('-r', dest='store_options',
+                        help='arguments for remote host')
+
+    group_adv = parser.add_argument_group('advanced arguments')
+    group_adv.add_argument('-v', '--verbose', dest='verbose',
+                           action='store_true', help='verbose')
+    group_adv.add_argument('--blksize', metavar='SIZE', default='512',
+                           help='specify block size')
+    group_adv.add_argument('--cachesize', metavar='SIZE', default='-1',
+                           help='specify max cache size')
+    group_adv.add_argument('--interval', metavar='TIME', default='0',
+                           help='specify interval time')
+
+    args = parser.parse_args()
+
+    import imp
+    mountpoint = args.mountpoint[0]
+    if not os.path.isdir(mountpoint):
+        parser.error('mountpoint not a directory')
+    operations = FuseOperations(
+        init_storage_operations(
+            args.url[0],
+            {
+                'cachesize': int(args.cachesize),
+                'interval': int(args.interval),
+            }
+        ),
+        blksize=int(args.blksize)
+    )
+    llfuse.init(operations, mountpoint, ['fsname=cpfs', "nonempty"])
+    set_logger(args.verbose, full=True)
+    main_thread = threading.Thread(target=llfuse.main)  # ,args={'single':True}
+
+    main_thread.start()
+    try:
+        while True:
+            sleep(1)
+            assert main_thread.isAlive()
+    except:
+        llfuse.close()
+        main_thread.join()
+        raise

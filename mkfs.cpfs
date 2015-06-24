@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+from __future__ import absolute_import
+
+from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.mkfs import init_metadata_db
+from cpfs.storage import parser_add_url, init_storage_operations
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+
+    parser_add_url(parser)
+
+    parser.add_argument('-g', '--gid', dest='gid', metavar='GID',
+                        help='specify git of root directory')
+    parser.add_argument('-u', '--uid', dest='uid', metavar='UID',
+                        help='specify uid of root directory')
+
+    args = parser.parse_args()
+
+    metadata_conn = TmpMetadataConnection()
+    init_metadata_db(
+        metadata_conn,
+        int(args.uid) if args.uid else 0,
+        int(args.gid) if args.gid else 0)
+
+    storage_operations = init_storage_operations(args.url[0])
+    if storage_operations.isfile(METADATA_STORAGE_NAME):
+        storage_operations.remove(METADATA_STORAGE_NAME)
+    storage_operations.create(METADATA_STORAGE_NAME)
+    storage_operations.write(METADATA_STORAGE_NAME, 0, metadata_conn.dump())
+    storage_operations.destory()
