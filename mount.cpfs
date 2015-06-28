@@ -2,7 +2,7 @@
 
 from __future__ import division, print_function, absolute_import
 
-from collections import Counter, defaultdict
+from collections import Counter
 import errno
 import llfuse
 from math import ceil
@@ -332,8 +332,6 @@ class FuseOperations(llfuse.Operations):
                     'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
                 if S_ISREG(mode):
                     self.store_op.close(str(inode))
-                    if not st_size:
-                        self.store_op.remove(str(inode))
                 del self.counter_inode_open[inode]
 
     def releasedir(self, fh):
@@ -373,13 +371,18 @@ class FuseOperations(llfuse.Operations):
         if not S_ISDIR(next(self.conn.execute(
                 'SELECT mode FROM inodes WHERE inode = ?', (entry[2],)))[0]):
             raise llfuse.FUSEError(errno.ENOTDIR)
-        '''if next(self.conn.execute(
-                'SELECT * FROM contents WHERE parent_inode = ?', (entry[2],))):
-            raise llfuse.FUSEError(errno.ENOTEMPTY)'''
+        if self.conn.execute(
+                'SELECT * FROM contents WHERE parent_inode = ?',
+                (entry[2],)).fetchone():
+            raise llfuse.FUSEError(errno.ENOTEMPTY)
         self._unlink(*entry)
 
     def setattr(self, inode, attr_i):
         self._debug('setattr', inode=inode, attr_i=attr_i)
+        if attr_i.st_size:
+            if attr_i.st_size != self.conn.execute(
+                    'SELECT size FROM inodes WHERE inode = ?', (inode,))[0]:
+                self.store_op.truncate(str(inode), attr_i.st_size)
         self.conn.write_execute(
             "UPDATE inodes SET {} WHERE inode = ?".format(
                 ', '.join(
@@ -393,8 +396,6 @@ class FuseOperations(llfuse.Operations):
                             'st_rdev', 'st_size',
                             'st_atime', 'st_ctime', 'st_mtime')
                         if getattr(attr_i, attr_name))))), (inode,))
-        if attr_i.st_size:
-            self.store_op.truncate(str(inode), attr_i.st_size)
         return self.getattr(inode)
 
     def setxattr(self, inode, key, value):
@@ -440,15 +441,15 @@ class FuseOperations(llfuse.Operations):
 
     def write(self, fh, offset, buf):
         self._debug('write', fh=fh, offset=offset, buf_len=len(buf))
-        self.store_op.write(str(self.register_fh_inode[fh]), offset, buf)
-        return len(buf)
+        return self.store_op.write(
+            str(self.register_fh_inode[fh]), offset, buf)
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
         description='Complete file system.',
-        usage='%(prog)s  [-p] [-r args] [-v] -c path \n'
+        usage='%(prog)s [-p] [-r args] [-v] -c path \n'
         'scheme://[[[username[:password]@]hostname][/path]] mountpoint',
     )
 
@@ -462,14 +463,9 @@ if __name__ == '__main__':
                            action='store_true', help='verbose')
     group_adv.add_argument('--blksize', metavar='SIZE', default='512',
                            help='specify block size')
-    group_adv.add_argument('--cachesize', metavar='SIZE', default='-1',
-                           help='specify max cache size')
-    group_adv.add_argument('--interval', metavar='TIME', default='0',
-                           help='specify interval time')
 
     args = parser.parse_args()
 
-    import imp
     mountpoint = args.mountpoint[0]
     if not os.path.isdir(mountpoint):
         parser.error('mountpoint not a directory')

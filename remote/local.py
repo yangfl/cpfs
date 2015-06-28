@@ -2,7 +2,7 @@ import os
 
 
 class StorageOperations:
-    '''Local storage with horrible performance'''
+    '''Local storage with terrible performance'''
     def __init__(self, hostname, path, username, password,
                  **additional_options):
         if not os.path.isdir(path):

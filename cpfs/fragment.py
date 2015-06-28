@@ -15,9 +15,13 @@ class FragmentCache:
         self.factory = factory
         self.stream = BytesIO()
         self.cached_scope = [-1]
+        self.dirty = False
         # odd: fragment beginning
         # even: fragment ending
         self.mutex = RLock()
+
+    def __len__(self):
+        return max(0, self.cached_scope[-1])
 
     def load(self, start_offset, end_offset, empty=False):
         with self.mutex:
@@ -51,9 +55,9 @@ class FragmentCache:
             if upper_index & 1:
                 self.cached_scope.insert(
                     lower_index_plus_one + 1, end_offset)
-            for check_index in (lower_index_plus_one, lower_index_plus_one,
-                                lower_index_plus_one + 2):
-                if check_index < len(self.cached_scope) and \
+            for check_index in (
+                    lower_index_plus_one, lower_index_plus_one + 2):
+                while check_index < len(self.cached_scope) and \
                         self.cached_scope[check_index] == \
                         self.cached_scope[check_index - 1]:
                     del self.cached_scope[check_index], \
@@ -65,9 +69,20 @@ class FragmentCache:
             self.stream.seek(offset)
             return self.stream.read(length)
 
+    def truncate(self, length):
+        with self.mutex:
+            self.stream.truncate(length)
+            index = bisect.bisect_left(self.cached_scope, length)
+            del self.cached_scope[index:]
+            if not index & 1:
+                self.cached_scope.append(length)
+        self.dirty = True
+        return length
+
     def write(self, offset, buf):
         with self.mutex:
             self.load(offset, offset + len(buf), True)
             self.stream.seek(offset)
             self.stream.write(buf)
+        self.dirty = True
         return len(buf)

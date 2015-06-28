@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import absolute_import
 
-from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
-from cpfs.mkfs import init_metadata_db
-from cpfs.storage import parser_add_url, init_storage_operations
 import argparse
 import os
 import zlib
+from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.mkfs import init_metadata_db
+from cpfs.storage import parser_add_url, init_storage_operations
 
 
 if __name__ == '__main__':
