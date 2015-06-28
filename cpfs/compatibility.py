@@ -1,4 +1,7 @@
-__all__ = ('PY2', 'blob_type', 'map', 'reduce', 'Queue', 'input', 'urlparse')
+__all__ = (
+    'PY2', 'blob_type', 'map', 'reduce', 'Queue', 'input', 'urlparse',
+    'BytesIO',
+)
 
 if bytes == str:
     PY2 = True
@@ -8,6 +11,7 @@ if bytes == str:
     from Queue import Queue
     input = raw_input
     from urlparse import urlparse
+    from cStringIO import StringIO as BytesIO
 else:
     PY2 = False
     blob_type = bytes
@@ -16,3 +20,4 @@ else:
     from queue import Queue
     input = input
     from urllib.parse import urlparse
+    from io import BytesIO

@@ -6,15 +6,15 @@ from collections import Counter, defaultdict
 import errno
 import llfuse
 from math import ceil
+import os
+from stat import *
+from time import time
+import threading
 from cpfs.compatibility import PY2, blob_type, Queue
 from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
 from cpfs.logger import logger, set_logger
 from cpfs.storage import parser_add_url, init_storage_operations
 from cpfs.register import Register
-import os
-from stat import *
-from time import time, sleep
-import threading
 
 
 class FuseOperations(llfuse.Operations):
@@ -488,6 +488,7 @@ if __name__ == '__main__':
     main_thread = threading.Thread(target=llfuse.main)  # ,args={'single':True}
 
     main_thread.start()
+    from time import sleep
     try:
         while True:
             sleep(1)

@@ -1,3 +1,7 @@
+'''
+MultithreadConnection
+Share sqlite3 connect between multi thread
+'''
 import os
 import sqlite3
 import tempfile

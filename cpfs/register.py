@@ -1,3 +1,7 @@
+'''
+Register
+Smart dict that auto generates unique id
+'''
 from threading import Lock, Condition
 from random import randint
 from time import time
