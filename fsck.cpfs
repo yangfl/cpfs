@@ -3,7 +3,7 @@ from __future__ import print_function, absolute_import
 
 from cpfs.fsck import do_fscks, CONVENTIONAL_CHECKS
 from cpfs.logger import set_logger
-from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.metadata import TmpMetadataConnection, read_metadata, write_metadata
 from cpfs.storage import parser_add_url, init_storage_operations
 
 
@@ -25,10 +25,8 @@ if __name__ == '__main__':
 
     set_logger(args.verbose)
 
-    storage_operations = init_storage_operations(args.url[0])
-    metadata_conn = TmpMetadataConnection(
-        storage_operations.read(METADATA_STORAGE_NAME)
-    )
+    storage_op = init_storage_operations(args.url[0])
+    metadata_conn = TmpMetadataConnection(read_metadata(storage_op))
 
     try:
         exit_code = do_fscks(CONVENTIONAL_CHECKS,
@@ -39,9 +37,7 @@ if __name__ == '__main__':
         exit_code = 32
 
     if exit_code == 1:
-        metadata_dump = metadata_conn.dump()
-        storage_operations.write(METADATA_STORAGE_NAME, 0, metadata_dump)
-        storage_operations.truncate(METADATA_STORAGE_NAME, len(metadata_dump))
-    storage_operations.destory()
+        write_metadata(storage_op, metadata_conn.dump())
+    storage_op.destory()
 
     exit(exit_code)

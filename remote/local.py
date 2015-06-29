@@ -12,35 +12,27 @@ class StorageOperations:
     def close(self, name):
         pass
 
-    def create(self, name):
-        os.mknod(os.path.join(self.path, name))
-
     def destory(self):
         pass
 
     def flush(self, name):
         pass
 
-    def isfile(self, name):
-        return os.path.isfile(os.path.join(self.path, name))
-
-    def read(self, name, offset=0, length=None):
+    def read(self, name, offset, length):
         file_path = os.path.join(self.path, name)
         with open(file_path, 'rb') as file_handle:
             file_handle.seek(offset)
-            if length:
-                return file_handle.read(length)
-            else:
+            if length == -1:
                 return file_handle.read()
+            else:
+                return file_handle.read(length)
 
     def open(self, name):
-        pass
+        if not os.path.isfile(os.path.join(self.path, name)):
+            os.mknod(os.path.join(self.path, name))
 
     def remove(self, name):
         os.remove(os.path.join(self.path, name))
-
-    def size(self, name):
-        return os.stat(os.path.join(self.path, name)).st_size
 
     def statfs(self):
         return (100, 10000)

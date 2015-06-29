@@ -3,9 +3,7 @@ from __future__ import absolute_import
 
 import argparse
 import os
-import zlib
-from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
-from cpfs.mkfs import init_metadata_db
+from cpfs.metadata import TmpMetadataConnection, read_metadata, write_metadata
 from cpfs.storage import parser_add_url, init_storage_operations
 
 
@@ -16,16 +14,11 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    storage_operations = init_storage_operations(args.url[0])
-    metadata_conn = TmpMetadataConnection(
-        storage_operations.read(METADATA_STORAGE_NAME)
-    )
+    storage_op = init_storage_operations(args.url[0])
+    metadata_conn = TmpMetadataConnection(read_metadata(storage_op))
 
     os.system('sqlitebrowser ' + metadata_conn.tmpfile_path)
 
-    with open(metadata_conn.tmpfile_path, 'rb') as tmpfile_file:
-        metadata_dump = zlib.compress(tmpfile_file.read())
+    write_metadata(storage_op, metadata_conn.dump())
     metadata_conn.close()
-    storage_operations.write(METADATA_STORAGE_NAME, 0, metadata_dump)
-    storage_operations.truncate(METADATA_STORAGE_NAME, len(metadata_dump))
     storage_operations.destory()

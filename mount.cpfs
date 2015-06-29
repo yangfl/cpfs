@@ -11,28 +11,25 @@ from stat import *
 from time import time
 import threading
 from cpfs.compatibility import PY2, blob_type, Queue
-from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME
+from cpfs.metadata import TmpMetadataConnection, read_metadata, write_metadata
 from cpfs.logger import logger, set_logger
 from cpfs.storage import parser_add_url, init_storage_operations
 from cpfs.register import Register
 
 
 class FuseOperations(llfuse.Operations):
-    def __init__(self, store_op, **kwargs):
+    def __init__(self, storage_op, **kwargs):
         super(FuseOperations, self).__init__()
 
         # basic
-        self.store_op = store_op
+        self.storage_op = storage_op
 
         # options
         self.__dict__.update(kwargs)
         '''blksize'''
 
         # load filesystem metadata
-        self.store_op.open(METADATA_STORAGE_NAME)
-        self.conn = TmpMetadataConnection(
-            self.store_op.read(METADATA_STORAGE_NAME))
-        self.store_op.close(METADATA_STORAGE_NAME)
+        self.conn = TmpMetadataConnection(read_metadata(storage_op))
         assert self.conn.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='inodes'").fetchone(), \
@@ -123,8 +120,8 @@ class FuseOperations(llfuse.Operations):
 
     def _remove(self, inode):
         # blob
-        if self.store_op.isfile(str(inode)):
-            self.store_op.remove(str(inode))
+        if self._isreg(inode):
+            self.storage_op.remove(str(inode))
         # metadata
         with self.conn.writeable_cursor() as remove_cur:
             remove_cur.execute("DELETE FROM xattrs WHERE inode = ?", (inode,))
@@ -172,13 +169,8 @@ class FuseOperations(llfuse.Operations):
 
     def destroy(self):
         self._debug('destory')
-        metadata_dump = self.conn.dump()
-        self.store_op.open(METADATA_STORAGE_NAME)
-        self.store_op.write(METADATA_STORAGE_NAME, 0, metadata_dump)
-        self.store_op.truncate(METADATA_STORAGE_NAME, len(metadata_dump))
-        self.store_op.flush(METADATA_STORAGE_NAME)
-        self.store_op.close(METADATA_STORAGE_NAME)
-        self.store_op.destory()
+        write_metadata(storage_op, metadata_conn.dump())
+        self.storage_op.destory()
 
     def flush(self, fh):
         # self._debug('flush', fh=fh)
@@ -197,11 +189,11 @@ class FuseOperations(llfuse.Operations):
         self._debug(flush and 'flush' or 'fsync', fh=fh, datasync=datasync)
         inode = self.register_fh_inode[fh]
         if self._isreg(inode):
-            self.store_op.flush(str(inode))
+            self.storage_op.flush(str(inode))
             if not datasync:
                 self.conn.write_execute(
                     "UPDATE inodes SET size = ? WHERE inode = ?",
-                    (self.store_op.size(str(inode)), inode))
+                    (self.storage_op.size(str(inode)), inode))
 
     def fsyncdir(self, fh, datasync):
         self._debug('fsyncdir', fh=fh, datasync=datasync)
@@ -292,9 +284,7 @@ class FuseOperations(llfuse.Operations):
         if flags & os.O_CREAT and flags & os.O_EXCL and st_size:
             raise llfuse.FUSEError(errno.EEXIST)
         if S_ISREG(mode):
-            if not st_size and not self.store_op.isfile(str(inode)):
-                self.store_op.create(str(inode))
-            self.store_op.open(str(inode))
+            self.storage_op.open(str(inode))
         with self.lock_counter_inode_open:
             self.counter_inode_open[inode] += 1
         return self.register_fh_inode.register(inode)
@@ -305,7 +295,7 @@ class FuseOperations(llfuse.Operations):
 
     def read(self, fh, offset, length):
         self._debug('read', fh=fh, offset=offset, length=length)
-        return self.store_op.read(
+        return self.storage_op.read(
             str(self.register_fh_inode[fh]), offset, length)
 
     def readdir(self, fh, offset):
@@ -331,7 +321,7 @@ class FuseOperations(llfuse.Operations):
                 mode, st_size, = next(self.conn.execute(
                     'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
                 if S_ISREG(mode):
-                    self.store_op.close(str(inode))
+                    self.storage_op.close(str(inode))
                 del self.counter_inode_open[inode]
 
     def releasedir(self, fh):
@@ -382,7 +372,7 @@ class FuseOperations(llfuse.Operations):
         if attr_i.st_size:
             if attr_i.st_size != self.conn.execute(
                     'SELECT size FROM inodes WHERE inode = ?', (inode,))[0]:
-                self.store_op.truncate(str(inode), attr_i.st_size)
+                self.storage_op.truncate(str(inode), attr_i.st_size)
         self.conn.write_execute(
             "UPDATE inodes SET {} WHERE inode = ?".format(
                 ', '.join(
@@ -419,7 +409,7 @@ class FuseOperations(llfuse.Operations):
 
     def statfs(self):
         self._debug('statfs')
-        used_size, total_size = self.store_op.statfs()
+        used_size, total_size = self.storage_op.statfs()
         self.stat_.f_blocks = total_size // self.stat_.f_frsize
         self.stat_.f_bfree = \
             self.stat_.f_blocks - used_size // self.stat_.f_frsize
@@ -441,7 +431,7 @@ class FuseOperations(llfuse.Operations):
 
     def write(self, fh, offset, buf):
         self._debug('write', fh=fh, offset=offset, buf_len=len(buf))
-        return self.store_op.write(
+        return self.storage_op.write(
             str(self.register_fh_inode[fh]), offset, buf)
 
 
@@ -455,7 +445,7 @@ if __name__ == '__main__':
 
     parser_add_url(parser)
     parser.add_argument('mountpoint', nargs=1)
-    parser.add_argument('-r', dest='store_options',
+    parser.add_argument('-r', dest='storage_options',
                         help='arguments for remote host')
 
     group_adv = parser.add_argument_group('advanced arguments')

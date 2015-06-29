@@ -97,3 +97,18 @@ class TmpMetadataConnection(MultithreadConnection):
     def close(self):
         super(TmpMetadataConnection, self).close()
         os.remove(self.tmpfile_path)
+
+
+def read_metadata(storage_op):
+    storage_op.open(METADATA_STORAGE_NAME)
+    dump = storage_op.read(METADATA_STORAGE_NAME, 0, -1)
+    storage_op.close(METADATA_STORAGE_NAME)
+    return dump
+
+
+def write_metadata(storage_op, dump):
+    storage_op.open(METADATA_STORAGE_NAME)
+    storage_op.write(METADATA_STORAGE_NAME, 0, dump)
+    storage_op.truncate(METADATA_STORAGE_NAME, len(dump))
+    storage_op.flush(METADATA_STORAGE_NAME)
+    storage_op.close(METADATA_STORAGE_NAME)

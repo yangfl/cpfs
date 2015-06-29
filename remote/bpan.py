@@ -6,8 +6,32 @@ from time import time
 from threading import Lock, Condition, Event, Thread
 from collections import defaultdict
 from cpfs.compatibility import BytesIO, urlencode, Request, urlopen, HTTPError
+from cpfs.metadata import METADATA_STORAGE_NAME
 from cpfs.orderedset import OrderedSet
 from cpfs.fragment import FragmentCache
+from cpfs.logger import logger
+
+
+def encode_multipart(params_dict):
+    '''
+    Build a multipart/form-data body with generated random boundary.
+    '''
+    boundary = '----%s' % hex(int(time() * 1000))
+    data = []
+    for key, value in params_dict.items():
+        data.append('--{}'.format(boundary))
+        if isinstance(value, str):
+            data.append(
+                'Content-Disposition: form-data; name="{}"\r\n'.format(key))
+            data.append(value)
+        else:
+            data.append(
+                'Content-Disposition: form-data; name="{}"; '
+                'filename="hidden"'.format(key))
+            data.append('Content-Type: application/octet-stream\r\n')
+            data.append(value.decode('ISO-8859-1'))
+    data.append('--{}--\r\n'.format(boundary))
+    return '\r\n'.join(data), boundary
 
 
 class StorageOperations:
@@ -50,7 +74,16 @@ class StorageOperations:
 
     def _post(self, base_url, parameters, data=b'', headers=None):
         parameters['access_token'] = self.access_token
-        req = Request('?'.join((base_url, urlencode(parameters))), data)
+        if data:
+            coded_parameters, boundary = encode_multipart(data)
+            req = Request(
+                '?'.join((base_url, urlencode(parameters))),
+                coded_parameters.encode('ISO-8859-1'))
+            req.add_header(
+                'Content-Type', 'multipart/form-data; boundary=%s' % boundary)
+        else:
+            req = Request(
+                '?'.join((base_url, urlencode(parameters))), data)
         if headers:
             req.headers.update(headers)
         try:
@@ -79,28 +112,26 @@ class StorageOperations:
             while self.queue_pending_files:
                 with self.mutex:
                     name = self.queue_pending_files.pop(False)
-                self._post(
-                    'https://c.pcs.baidu.com/rest/2.0/pcs/file', 
+                logger.debug(self._post(
+                    'https://c.pcs.baidu.com/rest/2.0/pcs/file',
                     {'method': 'upload', 'path': self._path(name)},
-                    self.dict_inode_buffer[name].read(
-                        0, len(self.dict_inode_buffer[name])))
+                    {'file': self.dict_files_buffer[name].read(
+                        0, len(self.dict_files_buffer[name]))}))
             if self.destroyed:
-                self.all_jobs_done.set()
                 break
-        
+        self.all_jobs_done.set()
+
     def close(self, name):
         if self.dict_files_buffer[name].dirty:
-            with self.mutex:
-                if name in self.queue_pending_files:
-                    self.queue_pending_files.discard(name)
-                self.queue_pending_files.add(name)
             if not len(self.dict_files_buffer[name]):
-                self.remove(name)
+                if self.dict_files_buffer[name].orig_exist:
+                    self.remove(name)
             else:
+                with self.mutex:
+                    if name in self.queue_pending_files:
+                        self.queue_pending_files.discard(name)
+                    self.queue_pending_files.add(name)
                 self.new_job.set()
-
-    def create(self, name):
-        pass
 
     def destory(self):
         self.destroyed = True
@@ -110,33 +141,37 @@ class StorageOperations:
     def flush(self, name):
         pass
 
-    def isfile(self, name):
-        return b'"error_code":31066' not in self._get(
-            'https://pcs.baidu.com/rest/2.0/pcs/file',
-            {'method': 'meta', 'path': self._path(name)})
-
     def open(self, name):
         with self.mutex:
             if name in self.queue_pending_files:
                 self.queue_pending_files.discard(name)
-        self.dict_inode_buffer[name] = FragmentCache(self._read_factory(name))
+        file_metadata = self._get(
+            'https://pcs.baidu.com/rest/2.0/pcs/file',
+            {'method': 'meta', 'path': self._path(name)})
+        file_cache = FragmentCache(self._read_factory(name))
+        self.dict_files_buffer[name] = file_cache
+        file_cache.orig_exist = b'"error_code":31066' not in file_metadata
+        if name == METADATA_STORAGE_NAME:
+            file_cache.orig_len = \
+                file_cache.orig_exist and \
+                self._json(file_metadata)['list'][0]['size'] or 0
 
-    def read(self, name, offset=0, length=None):
-        if not length:
-            length = self._json(self._get(
-                'https://pcs.baidu.com/rest/2.0/pcs/file',
-                {'method': 'meta', 'path': self._path(name)}
-            ))['list'][0]['size']
+    def read(self, name, offset, length):
+        if length == -1:
+            length = self.dict_files_buffer[name].orig_len - offset
+            assert length >= 0
         return self.dict_files_buffer[name].read(offset, length)
 
     def remove(self, name):
         with self.mutex:
             if name in self.queue_pending_files:
                 self.queue_pending_files.discard(name)
-        del self.dict_files_buffer[name]
-        self._post(
-            'https://pcs.baidu.com/rest/2.0/pcs/file', 
-            {'method': 'delete', 'path': self._path(name)})
+        if self.dict_files_buffer[name].orig_exist:
+            self._post(
+                'https://pcs.baidu.com/rest/2.0/pcs/file',
+                {'method': 'delete', 'path': self._path(name)})
+        if name in self.dict_files_buffer:
+            del self.dict_files_buffer[name]
 
     def statfs(self):
         if time() > self.quota[0] + 600:

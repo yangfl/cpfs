@@ -44,19 +44,6 @@ FSCK_RULES = dict((
         ),
         lambda entry: entry,
     )),
-    ('invalid_crc32', (
-        """
-        SELECT inode, crc32
-        FROM inodes
-        WHERE mode & 0xE000 | {0} != {0} AND crc32
-        """.format(S_IFREG),
-        lambda name, entry:
-            "{}: inode '{}' not regular file but crc32 '{}'".format(
-                name, *entry
-        ),
-        "UPDATE inodes SET crc32 = NULL WHERE inode = ?",
-        lambda entry: (entry[0],),
-    )),
     ('invalid_dir_nlink', (
         """
         SELECT inode, nlink
@@ -72,7 +59,7 @@ FSCK_RULES = dict((
 ))
 
 CONVENTIONAL_CHECKS = (
-    'nlink', 'invalid_symlink', 'invalid_crc32', 'invalid_dir_nlink'
+    'nlink', 'invalid_symlink', 'invalid_dir_nlink'
 )
 
 
