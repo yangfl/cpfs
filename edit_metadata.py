@@ -21,4 +21,4 @@ if __name__ == '__main__':
 
     write_metadata(storage_op, metadata_conn.dump())
     metadata_conn.close()
-    storage_operations.destory()
+    storage_op.destory()

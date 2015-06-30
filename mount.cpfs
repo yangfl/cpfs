@@ -460,7 +460,7 @@ if __name__ == '__main__':
     group_adv = parser.add_argument_group('advanced arguments')
     group_adv.add_argument('-v', '--verbose', dest='verbose',
                            action='store_true', help='verbose')
-    group_adv.add_argument('--blksize', metavar='SIZE', default='512',
+    group_adv.add_argument('--blksize', metavar='SIZE', default='1048576',
                            help='specify block size')
 
     args = parser.parse_args()

@@ -76,6 +76,8 @@ class FragmentCache:
             length = self._length_fix(offset, length)
             if not length:
                 return b''
+            if not self.dirty:
+                return self.factory(offset, length)
             self.load(offset, offset + length)
             self.stream.seek(offset)
             return self.stream.read(length)
