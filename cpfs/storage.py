@@ -23,6 +23,5 @@ def init_storage_operations(url, additional_options={}):
         )
     ).StorageOperations(
         parsed_url.hostname, parsed_url.path,
-        parsed_url.username, parsed_url.password,
-        **additional_options
+        parsed_url.username, parsed_url.password, additional_options
     )

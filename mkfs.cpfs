@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import absolute_import
 
-from cpfs.metadata import TmpMetadataConnection, write_metadata
+from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME, \
+    write_metadata
 from cpfs.mkfs import init_metadata_db
 from cpfs.storage import parser_add_url, init_storage_operations
 
@@ -26,5 +27,9 @@ if __name__ == '__main__':
         int(args.gid) if args.gid else 0)
 
     storage_op = init_storage_operations(args.url[0])
+    try:
+        storage_op.create(METADATA_STORAGE_NAME)
+    except:
+        pass
     write_metadata(storage_op, metadata_conn.dump())
     storage_op.destory()

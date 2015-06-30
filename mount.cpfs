@@ -4,12 +4,13 @@ from __future__ import division, print_function, absolute_import
 
 from collections import Counter
 import errno
-import llfuse
+import inspect
 from math import ceil
 import os
 from stat import *
 from time import time
 import threading
+import llfuse
 from cpfs.compatibility import PY2, blob_type, Queue
 from cpfs.metadata import TmpMetadataConnection, read_metadata, write_metadata
 from cpfs.logger import logger, set_logger
@@ -29,7 +30,7 @@ class FuseOperations(llfuse.Operations):
         '''blksize'''
 
         # load filesystem metadata
-        self.conn = TmpMetadataConnection(read_metadata(storage_op))
+        self.conn = TmpMetadataConnection(read_metadata(self.storage_op))
         assert self.conn.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type='table' AND name='inodes'").fetchone(), \
@@ -120,7 +121,9 @@ class FuseOperations(llfuse.Operations):
 
     def _remove(self, inode):
         # blob
-        if self._isreg(inode):
+        mode, st_size, = next(self.conn.execute(
+            'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
+        if S_ISREG(mode) and st_size:
             self.storage_op.remove(str(inode))
         # metadata
         with self.conn.writeable_cursor() as remove_cur:
@@ -169,7 +172,7 @@ class FuseOperations(llfuse.Operations):
 
     def destroy(self):
         self._debug('destory')
-        write_metadata(storage_op, metadata_conn.dump())
+        write_metadata(self.storage_op, self.conn.dump())
         self.storage_op.destory()
 
     def flush(self, fh):
@@ -279,13 +282,17 @@ class FuseOperations(llfuse.Operations):
 
     def open(self, inode, flags, is_dir=False):
         self._debug(is_dir and 'opendir' or 'open', inode=inode, flags=flags)
-        mode, st_size, = next(self.conn.execute(
-            'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
-        if flags & os.O_CREAT and flags & os.O_EXCL and st_size:
+        inode_i = self.getattr(inode)
+        if flags & os.O_CREAT and flags & os.O_EXCL and inode_i.st_size:
             raise llfuse.FUSEError(errno.EEXIST)
-        if S_ISREG(mode):
-            self.storage_op.open(str(inode))
         with self.lock_counter_inode_open:
+            if S_ISREG(inode_i.st_mode) and not self.counter_inode_open[inode]:
+                if not inode_i.st_size:
+                    self.storage_op.create(str(inode))
+                if 'attr' in inspect.getargspec(self.storage_op.open).args:
+                    self.storage_op.open(str(inode), inode_i)
+                else:
+                    self.storage_op.open(str(inode))
             self.counter_inode_open[inode] += 1
         return self.register_fh_inode.register(inode)
 
@@ -322,6 +329,8 @@ class FuseOperations(llfuse.Operations):
                     'SELECT mode, size FROM inodes WHERE inode = ?', (inode,)))
                 if S_ISREG(mode):
                     self.storage_op.close(str(inode))
+                    if not st_size:
+                        self.storage_op.remove(str(inode))
                 del self.counter_inode_open[inode]
 
     def releasedir(self, fh):
@@ -439,13 +448,13 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
         description='Complete file system.',
-        usage='%(prog)s [-p] [-r args] [-v] -c path \n'
-        'scheme://[[[username[:password]@]hostname][/path]] mountpoint',
+        usage='%(prog)s [-p] [-O args [...]] [-v] '
+        'scheme://[[[username[:password]@]hostname][/path]] mountpoint path ',
     )
 
     parser_add_url(parser)
     parser.add_argument('mountpoint', nargs=1)
-    parser.add_argument('-r', dest='storage_options',
+    parser.add_argument('-O', nargs='*', dest='storage_options',
                         help='arguments for remote host')
 
     group_adv = parser.add_argument_group('advanced arguments')
@@ -459,20 +468,17 @@ if __name__ == '__main__':
     mountpoint = args.mountpoint[0]
     if not os.path.isdir(mountpoint):
         parser.error('mountpoint not a directory')
-    operations = FuseOperations(
+    set_logger(args.verbose, full=True)    
+    fuse_op = FuseOperations(
         init_storage_operations(
-            args.url[0],
-            {
-                'cachesize': int(args.cachesize),
-                'interval': int(args.interval),
-            }
-        ),
-        blksize=int(args.blksize)
-    )
-    llfuse.init(operations, mountpoint, ['fsname=cpfs', "nonempty"])
-    set_logger(args.verbose, full=True)
-    main_thread = threading.Thread(target=llfuse.main)  # ,args={'single':True}
+            args.url[0], dict(
+                (key, (int(value) if value.isdigit() else value))
+                for key, value in map(
+                    lambda s: s.split('=', 1), args.storage_options))),
+        blksize=int(args.blksize))
+    llfuse.init(fuse_op, mountpoint, ['fsname=cpfs', "nonempty"])
 
+    main_thread = threading.Thread(target=llfuse.main)  # ,args={'single':True}
     main_thread.start()
     from time import sleep
     try:

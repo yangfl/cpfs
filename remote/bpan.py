@@ -35,17 +35,19 @@ def encode_multipart(params_dict):
 
 
 class StorageOperations:
-    def __init__(self, hostname, path, username, password,
-                 **additional_options):
+    def __init__(self, hostname, path, username, password, additional_options):
         if not hostname:
             raise ValueError("access_token missing")
         self.access_token = hostname
         self.app_path = path
         self.quota = (0, (0, 0))
         self.destroyed = False
+        self.dry_run = additional_options['dry_run'] \
+            if 'dry_run' in additional_options else False
 
         # blob control
         self.dict_files_buffer = {}
+        self.set_new_files = set()
         # upload control
         self.mutex = Lock()
         self.all_jobs_done = Event()
@@ -56,6 +58,9 @@ class StorageOperations:
         upload_thread.start()
 
     def _get(self, base_url, parameters, headers=None):
+        logger.debug(
+            'bpan: get(base_url={}, parameters={}, headers={})'.format(
+                base_url, parameters, headers))
         parameters['access_token'] = self.access_token
         req = Request('?'.join((base_url, urlencode(parameters))))
         if headers:
@@ -73,6 +78,12 @@ class StorageOperations:
         return json.loads(result.decode())
 
     def _post(self, base_url, parameters, data=b'', headers=None):
+        logger.debug(
+            'bpan: post(base_url={}, parameters={}, headers={})'.format(
+                base_url, parameters, headers))
+        if self.dry_run:
+            logger.debug('bpan: dry_run')
+            return
         parameters['access_token'] = self.access_token
         if data:
             coded_parameters, boundary = encode_multipart(data)
@@ -94,7 +105,13 @@ class StorageOperations:
     def _read_factory(self, name):
         path = self._path(name)
 
-        def read_factory(offset, length):
+        def read_factory(cache_i, offset, length):
+            if offset > len(cache_i):
+                return b''
+            if offset + length > len(cache_i):
+                length = len(cache_i) - offset
+            if length < 1:
+                return b''
             return self._get(
                 'https://d.pcs.baidu.com/rest/2.0/pcs/file',
                 {'method': 'download', 'path': path},
@@ -105,33 +122,43 @@ class StorageOperations:
         return read_factory
 
     def _upload(self):
+        last_wake = time()
         while True:
             if not self.queue_pending_files:
-                self.new_job.wait()
+                while time() < last_wake + 600 and not self.destroyed:
+                    self.new_job.wait()
+                last_wake = time()
                 self.new_job.clear()
             while self.queue_pending_files:
                 with self.mutex:
                     name = self.queue_pending_files.pop(False)
+                    self.dict_files_buffer[name].mutex.acquire()
                 logger.debug(self._post(
                     'https://c.pcs.baidu.com/rest/2.0/pcs/file',
-                    {'method': 'upload', 'path': self._path(name)},
+                    {
+                        'method': 'upload', 'path': self._path(name),
+                        'ondup': 'overwrite'},
                     {'file': self.dict_files_buffer[name].read(
-                        0, len(self.dict_files_buffer[name]))}))
+                        0, self.size(name))}))
+                self.dict_files_buffer[name].dirty = False
+                self.set_new_files.discard(name)
+                self.dict_files_buffer[name].mutex.release()
             if self.destroyed:
                 break
         self.all_jobs_done.set()
 
     def close(self, name):
         if self.dict_files_buffer[name].dirty:
-            if not len(self.dict_files_buffer[name]):
-                if self.dict_files_buffer[name].orig_exist:
-                    self.remove(name)
-            else:
+            if len(self.dict_files_buffer[name]):
                 with self.mutex:
-                    if name in self.queue_pending_files:
-                        self.queue_pending_files.discard(name)
+                    self.queue_pending_files.discard(name)
                     self.queue_pending_files.add(name)
                 self.new_job.set()
+            else:
+                self.remove(name)
+
+    def create(self, name):
+        self.set_new_files.add(name)
 
     def destory(self):
         self.destroyed = True
@@ -141,36 +168,37 @@ class StorageOperations:
     def flush(self, name):
         pass
 
-    def open(self, name):
+    def open(self, name, attr=None):
         with self.mutex:
             if name in self.queue_pending_files:
                 self.queue_pending_files.discard(name)
-        file_metadata = self._get(
-            'https://pcs.baidu.com/rest/2.0/pcs/file',
-            {'method': 'meta', 'path': self._path(name)})
-        file_cache = FragmentCache(self._read_factory(name))
-        self.dict_files_buffer[name] = file_cache
-        file_cache.orig_exist = b'"error_code":31066' not in file_metadata
-        if name == METADATA_STORAGE_NAME:
-            file_cache.orig_len = \
-                file_cache.orig_exist and \
-                self._json(file_metadata)['list'][0]['size'] or 0
+        if name not in self.dict_files_buffer:
+            self.dict_files_buffer[name] = FragmentCache(
+                self._read_factory(name))
+            if name in self.set_new_files:
+                self.dict_files_buffer[name].dirty = True
+            if attr:
+                self.dict_files_buffer[name].length = attr.st_size
+            elif name == METADATA_STORAGE_NAME:
+                self.dict_files_buffer[name].length = self._json(self._get(
+                        'https://pcs.baidu.com/rest/2.0/pcs/file',
+                        {'method': 'meta', 'path': self._path(name)}
+                    ))['list'][0]['size']
 
     def read(self, name, offset, length):
-        if length == -1:
-            length = self.dict_files_buffer[name].orig_len - offset
-            assert length >= 0
         return self.dict_files_buffer[name].read(offset, length)
 
     def remove(self, name):
-        with self.mutex:
-            if name in self.queue_pending_files:
-                self.queue_pending_files.discard(name)
-        if self.dict_files_buffer[name].orig_exist:
-            self._post(
-                'https://pcs.baidu.com/rest/2.0/pcs/file',
-                {'method': 'delete', 'path': self._path(name)})
-        if name in self.dict_files_buffer:
+        with self.dict_files_buffer[name].mutex:
+            with self.mutex:
+                if name in self.queue_pending_files:
+                    self.queue_pending_files.discard(name)
+            if name in self.set_new_files:
+                self.set_new_files.discard(name)
+            else:
+                self._post(
+                    'https://pcs.baidu.com/rest/2.0/pcs/file',
+                    {'method': 'delete', 'path': self._path(name)})
             del self.dict_files_buffer[name]
 
     def statfs(self):
@@ -180,6 +208,9 @@ class StorageOperations:
                 {'method': 'info'}))
             self.quota = (time(), (result['used'], result['quota']))
         return self.quota[1]
+
+    def size(self, name):
+        return len(self.dict_files_buffer[name])
 
     def truncate(self, name, length):
         return self.dict_files_buffer[name].truncate(length)

@@ -101,7 +101,8 @@ class TmpMetadataConnection(MultithreadConnection):
 
 def read_metadata(storage_op):
     storage_op.open(METADATA_STORAGE_NAME)
-    dump = storage_op.read(METADATA_STORAGE_NAME, 0, -1)
+    dump = storage_op.read(
+        METADATA_STORAGE_NAME, 0, storage_op.size(METADATA_STORAGE_NAME))
     storage_op.close(METADATA_STORAGE_NAME)
     return dump
 
