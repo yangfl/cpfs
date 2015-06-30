@@ -4,6 +4,7 @@ from __future__ import absolute_import
 from cpfs.metadata import TmpMetadataConnection, METADATA_STORAGE_NAME, \
     write_metadata
 from cpfs.mkfs import init_metadata_db
+from cpfs.logger import logger, set_logger
 from cpfs.storage import parser_add_url, init_storage_operations
 
 
@@ -13,23 +14,28 @@ if __name__ == '__main__':
 
     parser_add_url(parser)
 
+    parser.add_argument('-o', dest='mount_arguments',
+                        help='arguments for remote host')
     parser.add_argument('-g', '--gid', dest='gid', metavar='GID',
                         help='specify git of root directory')
     parser.add_argument('-u', '--uid', dest='uid', metavar='UID',
                         help='specify uid of root directory')
+    parser.add_argument('-v', '--verbose', dest='verbose',
+                        action='store_true', help='verbose')
 
     args = parser.parse_args()
 
+    set_logger(args.verbose, full=True)
     metadata_conn = TmpMetadataConnection()
     init_metadata_db(
         metadata_conn,
-        int(args.uid) if args.uid else 0,
-        int(args.gid) if args.gid else 0)
+        int(args.uid) if args.uid else 0, int(args.gid) if args.gid else 0)
 
-    storage_op = init_storage_operations(args.url[0])
+    storage_op = init_storage_operations(args.url[0], args.mount_arguments)
     try:
         storage_op.create(METADATA_STORAGE_NAME)
     except:
         pass
     write_metadata(storage_op, metadata_conn.dump())
+    print(storage_op.size(METADATA_STORAGE_NAME))
     storage_op.destory()

@@ -42,8 +42,7 @@ class StorageOperations:
         self.app_path = path
         self.quota = (0, (0, 0))
         self.destroyed = False
-        self.dry_run = additional_options['dry_run'] \
-            if 'dry_run' in additional_options else False
+        self.dry_run = 'ro' in additional_options
 
         # blob control
         self.dict_files_buffer = {}
@@ -83,13 +82,13 @@ class StorageOperations:
                 base_url, parameters, headers))
         if self.dry_run:
             logger.debug('bpan: dry_run')
-            return
+            return b''
         parameters['access_token'] = self.access_token
         if data:
-            coded_parameters, boundary = encode_multipart(data)
+            data, boundary = encode_multipart(data)
             req = Request(
                 '?'.join((base_url, urlencode(parameters))),
-                coded_parameters.encode('ISO-8859-1'))
+                data.encode('ISO-8859-1'))
             req.add_header(
                 'Content-Type', 'multipart/form-data; boundary=%s' % boundary)
         else:
@@ -105,13 +104,7 @@ class StorageOperations:
     def _read_factory(self, name):
         path = self._path(name)
 
-        def read_factory(cache_i, offset, length):
-            if offset > len(cache_i):
-                return b''
-            if offset + length > len(cache_i):
-                length = len(cache_i) - offset
-            if length < 1:
-                return b''
+        def read_factory(offset, length):
             return self._get(
                 'https://d.pcs.baidu.com/rest/2.0/pcs/file',
                 {'method': 'download', 'path': path},
@@ -177,13 +170,14 @@ class StorageOperations:
                 self._read_factory(name))
             if name in self.set_new_files:
                 self.dict_files_buffer[name].dirty = True
-            if attr:
+                self.dict_files_buffer[name].length = 0
+            elif attr:
                 self.dict_files_buffer[name].length = attr.st_size
-            elif name == METADATA_STORAGE_NAME:
+            else:
                 self.dict_files_buffer[name].length = self._json(self._get(
-                        'https://pcs.baidu.com/rest/2.0/pcs/file',
-                        {'method': 'meta', 'path': self._path(name)}
-                    ))['list'][0]['size']
+                    'https://pcs.baidu.com/rest/2.0/pcs/file',
+                    {'method': 'meta', 'path': self._path(name)}
+                ))['list'][0]['size']
 
     def read(self, name, offset, length):
         return self.dict_files_buffer[name].read(offset, length)

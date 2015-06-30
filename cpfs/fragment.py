@@ -24,6 +24,13 @@ class FragmentCache:
     def __len__(self):
         return max(0, self.cached_scope[-1], self.length)
 
+    def _length_fix(self, offset, length):
+        if offset > len(self):
+            return 0
+        if offset + length > len(self):
+            return len(self) - offset
+        return length
+
     def load(self, start_offset, end_offset, empty=False):
         with self.mutex:
             lower_index_plus_one = bisect.bisect_right(
@@ -46,7 +53,7 @@ class FragmentCache:
                         if current_slice_index[1] & 1:
                             self.stream.seek(last_slice_index[0])
                             self.stream.write(self.factory(
-                                self, last_slice_index[0],
+                                last_slice_index[0],
                                 current_slice_index[0] - last_slice_index[0]))
                 except StopIteration:
                     pass
@@ -66,6 +73,9 @@ class FragmentCache:
 
     def read(self, offset, length):
         with self.mutex:
+            length = self._length_fix(offset, length)
+            if not length:
+                return b''
             self.load(offset, offset + length)
             self.stream.seek(offset)
             return self.stream.read(length)
@@ -87,4 +97,6 @@ class FragmentCache:
             self.stream.seek(offset)
             self.stream.write(buf)
             self.dirty = True
+            if self.cached_scope[-1] > self.length:
+                self.length = self.cached_scope[-1]
         return len(buf)

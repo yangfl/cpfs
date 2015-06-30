@@ -448,13 +448,13 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
         description='Complete file system.',
-        usage='%(prog)s [-p] [-O args [...]] [-v] '
+        usage='%(prog)s [-p] [-o args...] [-v] '
         'scheme://[[[username[:password]@]hostname][/path]] mountpoint path ',
     )
 
     parser_add_url(parser)
     parser.add_argument('mountpoint', nargs=1)
-    parser.add_argument('-O', nargs='*', dest='storage_options',
+    parser.add_argument('-o', dest='mount_arguments',
                         help='arguments for remote host')
 
     group_adv = parser.add_argument_group('advanced arguments')
@@ -468,13 +468,9 @@ if __name__ == '__main__':
     mountpoint = args.mountpoint[0]
     if not os.path.isdir(mountpoint):
         parser.error('mountpoint not a directory')
-    set_logger(args.verbose, full=True)    
+    set_logger(args.verbose, full=True)
     fuse_op = FuseOperations(
-        init_storage_operations(
-            args.url[0], dict(
-                (key, (int(value) if value.isdigit() else value))
-                for key, value in map(
-                    lambda s: s.split('=', 1), args.storage_options))),
+        init_storage_operations(args.url[0], args.mount_arguments),
         blksize=int(args.blksize))
     llfuse.init(fuse_op, mountpoint, ['fsname=cpfs', "nonempty"])
 
