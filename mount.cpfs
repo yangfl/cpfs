@@ -111,9 +111,8 @@ class FuseOperations(llfuse.Operations):
             return not single and (name for name in ([],)) or []
         path_generator = (
             self._path(parent_inode, True) + [name]
-            for name, parent_inode in
-            self.conn.execute(
-                "SELECT name, parent_inode FROM contents  WHERE inode = ?",
+            for name, parent_inode in self.conn.execute(
+                "SELECT name, parent_inode FROM contents WHERE inode = ?",
                 (inode,)))
         if single:
             return path_generator.next()
@@ -387,8 +386,8 @@ class FuseOperations(llfuse.Operations):
                 ', '.join(
                     map(' = '.join, (
                         (
-                            attr_name.startswith('st_') and attr_name[3:]
-                            or attr_name,
+                            attr_name.startswith(
+                                'st_') and attr_name[3:] or attr_name,
                             str(getattr(attr_i, attr_name)))
                         for attr_name in (
                             'generation', 'st_mode', 'st_uid', 'st_gid',

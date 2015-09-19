@@ -58,7 +58,7 @@ TABLE_INODES_STRUCTURE = OrderedDict((
     ('mode', 'SMALLINT NOT NULL'),
     ('nlink', 'INT NOT NULL DEFAULT 0'),
     ('uid', 'INT NOT NULL'),
-    ('gid', 'NT NOT NULL'),
+    ('gid', 'INT NOT NULL'),
     ('rdev', 'INT NOT NULL DEFAULT 0'),
     ('size', 'INT NOT NULL DEFAULT 0'),
     ('atime', 'REAL NOT NULL'),
@@ -111,8 +111,8 @@ def init_metadata_db(conn, uid=0, gid=0):
     cur.execute(
         "INSERT INTO inodes (inode, mode, nlink, uid, gid, "
         "atime, ctime, mtime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (ROOT_INODE, S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP
-         | S_IROTH | S_IXOTH, 1, uid, gid) + (time(),) * 3)
+        (ROOT_INODE, S_IFDIR | S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
+         S_IXGRP | S_IROTH | S_IXOTH, 1, uid, gid) + (time(),) * 3)
     cur.execute(
         "INSERT INTO contents (name, parent_inode, inode) VALUES (?,?,?)",
         (blob_type(b'..'), ROOT_INODE, ROOT_INODE))

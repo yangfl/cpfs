@@ -14,5 +14,5 @@ def set_logger(verbose=False, full=False):
         formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s: %(message)s')
         ch.setFormatter(formatter)
-        logging.getLogger('llfuse').addHandler(ch)
+        logging.getLogger(__name__).addHandler(ch)
     logger.addHandler(ch)
